@@ -13,38 +13,55 @@ namespace app
 
         public Socket First;
         public Socket Second;
-        public TaskCompletionSource<object> Rendezvous;
+        public TaskCompletionSource<Socket> Rendezvous;
 
         public RelayItem(Socket first)
         {
             First = first;
-            Rendezvous = new TaskCompletionSource<object>();
+            Rendezvous = new TaskCompletionSource<Socket>();
         }
 
-        public RelayItem(Socket first, Socket second, TaskCompletionSource<object> rendezvous) : this(first)
+        public RelayItem(Socket first, Socket second, TaskCompletionSource<Socket> rendezvous) : this(first)
         {
             Second = second;
             Rendezvous = rendezvous;
         }
     }
 
-    class Program
+    public class Program
     {
         public static ConcurrentDictionary<string, RelayItem> connections
             = new ConcurrentDictionary<string, RelayItem>();
 
         static async Task Main(string[] args)
         {
+            CancellationToken token = default;
+            var port = 10000;
+
+            await Start(port, token);
+        }
+
+        public static async Task Start(int port, CancellationToken token)
+        {
             var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
-            var endPoint = new IPEndPoint(IPAddress.Loopback, 10000);
+            var endPoint = new IPEndPoint(IPAddress.Loopback, port);
             socket.Bind(endPoint);
             socket.Listen(10);
+            token.Register(() => socket.Close());
 
             var tasks = new List<Task>();
-            CancellationToken token = default;
-            while(!token.IsCancellationRequested) {
-                var incomingSocket = await socket.AcceptAsync();
-                tasks.Add(HandleSocket(incomingSocket, token));
+            while (!token.IsCancellationRequested)
+            {
+                try {
+                    var incomingSocket = await socket.AcceptAsync();
+                    tasks.Add(HandleSocket(incomingSocket, token));
+                }
+                catch (SocketException e)
+                {
+                    if (token.IsCancellationRequested && e.SocketErrorCode == SocketError.OperationAborted)
+                        break;
+                    throw;
+                }
             }
             await Task.WhenAll(tasks);
         }
@@ -52,6 +69,8 @@ namespace app
         public static async Task HandleSocket(Socket socket, CancellationToken token)
         {
             using (socket) {
+                //ReceiveAsync abort
+                token.Register(() => socket.Close());
                 var buffer = new byte[10_000];
                 var readed = await socket.ReceiveAsync(buffer, SocketFlags.None, token);
                 if (readed != 16)
@@ -61,24 +80,37 @@ namespace app
                 var key = new Guid(buffer.AsSpan(0, 16)).ToString();
                 var created = new RelayItem(socket);
                 var current = connections.GetOrAdd(key, created);
-                if (current != default)
+                Socket target = null;
+                if (current != created)
                 {
                     if (!connections.TryUpdate(key, new RelayItem(current.First, socket, current.Rendezvous), current))
                     {
-                        current.Rendezvous.SetResult(new Exception("Internal state corruption"));
+                        current.Rendezvous.SetException(new Exception("Internal state corruption"));
                         return;
                     }
-                    current.Rendezvous.SetResult(new object());
+                    current.Rendezvous.SetResult(socket);
+                    target = current.First;
                 }
-                var target = current?.First;
-                if (target == null)
+                else
                 {
-                    await created.Rendezvous.Task;
+                    //todo cancellation
+                    target = await created.Rendezvous.Task;
                 }
-                while(!token.IsCancellationRequested)
+
+                try {
+                    while (!token.IsCancellationRequested)
+                    {
+                        //cancellation not working, wat?
+                        readed = await socket.ReceiveAsync(buffer, SocketFlags.None, token);
+                        Console.WriteLine($"{socket.RemoteEndPoint} reader {readed}bytes");
+                        await target.SendAsync(new ArraySegment<byte>(buffer, 0, readed), SocketFlags.None, token);
+                    }
+                }
+                catch (SocketException e)
                 {
-                    readed = await socket.ReceiveAsync(buffer, SocketFlags.None, token);
-                    await target.SendAsync(new ArraySegment<byte>(buffer, 0, readed), SocketFlags.None, token);
+                    if (token.IsCancellationRequested && e.SocketErrorCode == SocketError.OperationAborted)
+                        return;
+                    throw;
                 }
             }
         }
