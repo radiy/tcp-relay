@@ -100,6 +100,7 @@ namespace app
                 try {
                     while (!token.IsCancellationRequested)
                     {
+                        //https://github.com/dotnet/corefx/pull/36516 not working in 2.2 check 3.0
                         //cancellation not working, wat?
                         readed = await socket.ReceiveAsync(buffer, SocketFlags.None, token);
                         Console.WriteLine($"{socket.RemoteEndPoint} reader {readed}bytes");
